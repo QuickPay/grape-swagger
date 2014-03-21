@@ -279,8 +279,13 @@ module Grape
 
             def parse_entity_name(name)
               entity_parts = name.to_s.split('::')
-              entity_parts.reject! {|p| p == "Entity" || p == "Entities"}
-              entity_parts.join("::")
+              idx = entity_parts.rindex {|p| p == "Entity" || p == "Entities" }
+              if idx.nil?
+                idx = 0
+              else
+                idx = idx + 1
+              end
+              entity_parts[idx..-1].join('::')
             end
 
             def parse_entity_models(models)
@@ -304,6 +309,14 @@ module Grape
                   name:       model.instance_variable_get(:@root) || name,
                   properties: properties
                 }
+
+                nested_models = []
+
+                model.exposures.each do |k,options|
+                  nested_models << options[:using] if options[:using]
+                end
+
+                parse_entity_models(nested_models).each {|k,v| result[k] = v }
               end
 
               result
