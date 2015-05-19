@@ -9,7 +9,6 @@ require 'grape-entity'
 require 'rubygems'
 require 'bundler'
 
-require 'pry'
 require 'json'
 
 Bundler.setup :default, :test
@@ -21,4 +20,5 @@ RSpec.configure do |config|
   config.include RSpec::Matchers
   config.mock_with :rspec
   config.include Rack::Test::Methods
+  config.raise_errors_for_deprecations!
 end

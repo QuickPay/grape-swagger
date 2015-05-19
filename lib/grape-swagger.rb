@@ -1,361 +1,182 @@
-require 'kramdown'
+require 'grape'
+require 'grape-swagger/version'
+require 'grape-swagger/errors'
+require 'grape-swagger/doc_methods'
+require 'grape-swagger/markdown'
+require 'grape-swagger/markdown/kramdown_adapter'
+require 'grape-swagger/markdown/redcarpet_adapter'
 
 module Grape
   class API
     class << self
-      attr_reader :combined_routes
+      attr_accessor :combined_routes, :combined_namespaces, :combined_namespace_routes, :combined_namespace_identifiers
 
-      def add_swagger_documentation(options={})
+      def add_swagger_documentation(options = {})
         documentation_class = create_documentation_class
 
-        documentation_class.setup({:target_class => self}.merge(options))
+        options = { target_class: self }.merge(options)
+        @target_class = options[:target_class]
+
+        documentation_class.setup(options)
         mount(documentation_class)
 
-        @combined_routes = {}
-
-        routes.each do |route|
-          route_match = route.route_path.split(route.route_prefix).last.match('\/([\w|-]*?)[\.\/\(]')
-          next if route_match.nil?
+        @target_class.combined_routes = {}
+        @target_class.routes.each do |route|
+          route_path = route.route_path
+          route_match = route_path.split(/^.*?#{route.route_prefix.to_s}/).last
+          next unless route_match
+          route_match = route_match.match('\/([\w|-]*?)[\.\/\(]') || route_match.match('\/([\w|-]*)$')
+          next unless route_match
           resource = route_match.captures.first
           next if resource.empty?
           resource.downcase!
-
-          @combined_routes[resource] ||= []
-
-          unless @@hide_documentation_path and route.route_path.include?(@@mount_path)
-            @combined_routes[resource] << route
-          end
+          @target_class.combined_routes[resource] ||= []
+          next if documentation_class.hide_documentation_path && route.route_path.include?(documentation_class.mount_path)
+          @target_class.combined_routes[resource] << route
         end
 
+        @target_class.combined_namespaces = {}
+        combine_namespaces(@target_class)
+
+        @target_class.combined_namespace_routes = {}
+        @target_class.combined_namespace_identifiers = {}
+        combine_namespace_routes(@target_class.combined_namespaces)
+
+        exclusive_route_keys = @target_class.combined_routes.keys - @target_class.combined_namespaces.keys
+        exclusive_route_keys.each { |key| @target_class.combined_namespace_routes[key] = @target_class.combined_routes[key] }
+        documentation_class
       end
 
       private
 
+      def combine_namespaces(app)
+        app.endpoints.each do |endpoint|
+          ns = if endpoint.respond_to?(:namespace_stackable)
+                 endpoint.namespace_stackable(:namespace).last
+               else
+                 endpoint.settings.stack.last[:namespace]
+               end
+          # use the full namespace here (not the latest level only)
+          # and strip leading slash
+          @target_class.combined_namespaces[endpoint.namespace.sub(/^\//, '')] = ns if ns
+
+          combine_namespaces(endpoint.options[:app]) if endpoint.options[:app]
+        end
+      end
+
+      def combine_namespace_routes(namespaces)
+        # iterate over each single namespace
+        namespaces.each do |name, namespace|
+          # get the parent route for the namespace
+          parent_route_name = name.match(%r{^/?([^/]*).*$})[1]
+          parent_route = @target_class.combined_routes[parent_route_name]
+          # fetch all routes that are within the current namespace
+          namespace_routes = parent_route.collect do |route|
+            route if (route.route_path.start_with?(route.route_prefix ? "/#{route.route_prefix}/#{name}" : "/#{name}") || route.route_path.start_with?((route.route_prefix ? "/#{route.route_prefix}/:version/#{name}" : "/:version/#{name}"))) &&
+                     (route.instance_variable_get(:@options)[:namespace] == "/#{name}" || route.instance_variable_get(:@options)[:namespace] == "/:version/#{name}")
+          end.compact
+
+          if namespace.options.key?(:swagger) && namespace.options[:swagger][:nested] == false
+            # Namespace shall appear as standalone resource, use specified name or use normalized path as name
+            if namespace.options[:swagger].key?(:name)
+              identifier = namespace.options[:swagger][:name].gsub(/ /, '-')
+            else
+              identifier = name.gsub(/_/, '-').gsub(/\//, '_')
+            end
+            @target_class.combined_namespace_identifiers[identifier] = name
+            @target_class.combined_namespace_routes[identifier] = namespace_routes
+
+            # get all nested namespaces below the current namespace
+            sub_namespaces = standalone_sub_namespaces(name, namespaces)
+            # convert namespace to route names
+            sub_ns_paths = sub_namespaces.collect { |ns_name, _| "/#{ns_name}" }
+            sub_ns_paths_versioned = sub_namespaces.collect { |ns_name, _| "/:version/#{ns_name}" }
+            # get the actual route definitions for the namespace path names
+            sub_routes = parent_route.collect do |route|
+              route if sub_ns_paths.include?(route.instance_variable_get(:@options)[:namespace]) || sub_ns_paths_versioned.include?(route.instance_variable_get(:@options)[:namespace])
+            end.compact
+            # add all determined routes of the sub namespaces to standalone resource
+            @target_class.combined_namespace_routes[identifier].push(*sub_routes)
+          else
+            # default case when not explicitly specified or nested == true
+            standalone_namespaces = namespaces.reject { |_, ns| !ns.options.key?(:swagger) || !ns.options[:swagger].key?(:nested) || ns.options[:swagger][:nested] != false }
+            parent_standalone_namespaces = standalone_namespaces.reject { |ns_name, _| !name.start_with?(ns_name) }
+            # add only to the main route if the namespace is not within any other namespace appearing as standalone resource
+            if parent_standalone_namespaces.empty?
+              # default option, append namespace methods to parent route
+              @target_class.combined_namespace_routes[parent_route_name] = [] unless @target_class.combined_namespace_routes.key?(parent_route_name)
+              @target_class.combined_namespace_routes[parent_route_name].push(*namespace_routes)
+            end
+          end
+        end
+      end
+
+      def standalone_sub_namespaces(name, namespaces)
+        # assign all nested namespace routes to this resource, too
+        # (unless they are assigned to another standalone namespace themselves)
+        sub_namespaces = {}
+        # fetch all namespaces that are children of the current namespace
+        namespaces.each { |ns_name, ns| sub_namespaces[ns_name] = ns if ns_name.start_with?(name) && ns_name != name }
+        # remove the sub namespaces if they are assigned to another standalone namespace themselves
+        sub_namespaces.each do |sub_name, sub_ns|
+          # skip if sub_ns is standalone, too
+          next unless sub_ns.options.key?(:swagger) && sub_ns.options[:swagger][:nested] == false
+          # remove all namespaces that are nested below this standalone sub_ns
+          sub_namespaces.each { |sub_sub_name, _| sub_namespaces.delete(sub_sub_name) if sub_sub_name.start_with?(sub_name) }
+        end
+        sub_namespaces
+      end
+
+      def get_non_nested_params(params)
+        # Duplicate the params as we are going to modify them
+        dup_params = params.each_with_object({}) do |(param, value), dparams|
+          dparams[param] = value.dup
+        end
+
+        dup_params.reject do |param, value|
+          is_nested_param = /^#{ Regexp.quote param }\[.+\]$/
+          0 < dup_params.count do |p, _|
+            match = p.match(is_nested_param)
+            dup_params[p][:required] = false if match && !value[:required]
+            match
+          end
+        end
+      end
+
+      def parse_array_params(params)
+        modified_params = {}
+        array_param = nil
+        params.each_key do |k|
+          if params[k].is_a?(Hash) && params[k][:type] == 'Array'
+            array_param = k
+            modified_params[k] = params[k]
+          else
+            new_key = k
+            unless array_param.nil?
+              if k.to_s.start_with?(array_param.to_s + '[')
+                new_key = array_param.to_s + '[]' + k.to_s.split(array_param)[1]
+                modified_params.delete array_param
+              end
+            end
+            modified_params[new_key] = params[k]
+          end
+        end
+        modified_params
+      end
+
+      def parse_enum_values(values)
+        if values.is_a?(Range) && [Integer, String].any? { |klass| values.first.is_a?(klass) }
+          values.to_a
+        elsif values.is_a?(Proc)
+          values.call
+        else
+          values
+        end
+      end
+
       def create_documentation_class
-
         Class.new(Grape::API) do
-          class << self
-            def name
-              @@class_name
-            end
-          end
-
-          def self.setup(options)
-            defaults = {
-              :target_class             => nil,
-              :mount_path               => '/swagger_doc',
-              :base_path                => nil,
-              :api_version              => '0.1',
-              :markdown                 => false,
-              :hide_documentation_path  => false,
-              :hide_format              => false,
-              :format                   => nil,
-              :models                   => [],
-              :info                     => {},
-              :authorizations           => nil,
-              :root_base_path           => true,
-              :include_base_url         => true
-            }
-
-            options = defaults.merge(options)
-
-            target_class     = options[:target_class]
-            @@mount_path     = options[:mount_path]
-            @@class_name     = options[:class_name] || options[:mount_path].gsub('/', '')
-            @@markdown       = options[:markdown]
-            @@hide_format    = options[:hide_format]
-            api_version      = options[:api_version]
-            base_path        = options[:base_path]
-            authorizations   = options[:authorizations]
-            include_base_url = options[:include_base_url]
-            root_base_path   = options[:root_base_path]
-            extra_info       = options[:info]
-
-            @@hide_documentation_path = options[:hide_documentation_path]
-
-            if options[:format]
-              [:format, :default_format, :default_error_formatter].each do |method|
-                send(method, options[:format])
-              end
-            end
-
-            desc 'Swagger compatible API description'
-            get @@mount_path do
-              header['Access-Control-Allow-Origin']   = '*'
-              header['Access-Control-Request-Method'] = '*'
-
-              routes = target_class::combined_routes
-
-              if @@hide_documentation_path
-                routes.reject!{ |route, value| "/#{route}/".index(parse_path(@@mount_path, nil) << '/') == 0 }
-              end
-
-              routes_array = routes.keys.map do |local_route|
-                next if routes[local_route].all?(&:route_hidden)
-
-                url_base    = parse_path(route.route_path.gsub('(.:format)', ''), route.route_version) if include_base_url
-                url_format  = '.{format}' unless @@hide_format
-                {
-                  :path => "#{url_base}/#{local_route}#{url_format}",
-                  #:description => "..."
-                }
-              end.compact
-
-              output = {
-                apiVersion:     api_version,
-                swaggerVersion: "1.2",
-                produces:       content_types_for(target_class),
-                operations:     [],
-                apis:           routes_array,
-                info:           parse_info(extra_info)
-              }
-
-              basePath                = parse_base_path(base_path, request)
-              output[:basePath]       = basePath        if basePath && basePath.size > 0 && root_base_path != false
-              output[:authorizations] = authorizations  if authorizations
-
-              output
-            end
-
-            desc 'Swagger compatible API description for specific API', :params => {
-              "name" => {
-                :desc     => "Resource name of mounted API",
-                :type     => "string",
-                :required => true
-              }
-            }
-            get "#{@@mount_path}/:name" do
-              header['Access-Control-Allow-Origin']   = '*'
-              header['Access-Control-Request-Method'] = '*'
-
-              models = []
-              routes = target_class::combined_routes[params[:name]]
-
-              ops = routes.reject(&:route_hidden).group_by do |route|
-                parse_path(route.route_path, api_version)
-              end
-
-              apis = []
-
-              ops.each do |path, routes|
-                operations = routes.map do |route|
-                  notes       = as_markdown(route.route_notes)
-                  http_codes  = parse_http_codes(route.route_http_codes)
-
-                  models << route.route_entity if route.route_entity
-
-                  operation = {
-                    :produces   => content_types_for(target_class),
-                    :notes      => notes.to_s,
-                    :summary    => route.route_description || '',
-                    :nickname   => route.route_nickname || (route.route_method + route.route_path.gsub(/[\/:\(\)\.]/,'-')),
-                    :httpMethod => route.route_method,
-                    :parameters => parse_header_params(route.route_headers) +
-                      parse_params(route.route_params, route.route_path, route.route_method)
-                  }
-                  operation.merge!(:type => parse_entity_name(route.route_entity)) if route.route_entity
-                  operation.merge!(:responseMessages => http_codes) unless http_codes.empty?
-                  operation
-                end.compact
-                apis << {
-                  path: path,
-                  operations: operations
-                }
-              end
-
-              api_description = {
-                apiVersion:     api_version,
-                swaggerVersion: "1.2",
-                resourcePath:   "",
-                apis:           apis
-              }
-
-              basePath                   = parse_base_path(base_path, request)
-              api_description[:basePath] = basePath if basePath && basePath.size > 0
-              api_description[:models]   = parse_entity_models(models) unless models.empty?
-
-              api_description
-            end
-          end
-
-          helpers do
-
-            def as_markdown(description)
-              description && @@markdown ? Kramdown::Document.new(strip_heredoc(description), :input => 'GFM', :enable_coderay => false).to_html : description
-            end
-
-            def parse_params(params, path, method)
-              params ||= []
-
-              params.map do |param, value|
-                value[:type] = 'file' if value.is_a?(Hash) && value[:type] == 'Rack::Multipart::UploadedFile'
-
-                dataType    = value.is_a?(Hash) ? (value[:type] || 'String').to_s : 'String'
-                description = value.is_a?(Hash) ? value[:desc] || value[:description] : ''
-                required    = value.is_a?(Hash) ? !!value[:required] : false
-                defaultValue = value.is_a?(Hash) ? value[:defaultValue] : nil
-                paramType = if path.include?(":#{param}")
-                   'path'
-                else
-                  %w[ POST PUT PATCH ].include?(method) ? 'form' : 'query'
-                end
-                name        = (value.is_a?(Hash) && value[:full_name]) || param
-
-                parsed_params = {
-                  paramType:    paramType,
-                  name:         name,
-                  description:  as_markdown(description),
-                  type:         dataType,
-                  dataType:     dataType,
-                  required:     required
-                }
-
-                parsed_params.merge!({defaultValue: defaultValue}) if defaultValue
-
-                parsed_params
-              end
-            end
-
-            def content_types_for(target_class)
-              content_types = (target_class.settings[:content_types] || {}).values
-
-              if content_types.empty?
-                formats       = [target_class.settings[:format], target_class.settings[:default_format]].compact.uniq
-                formats       = Grape::Formatter::Base.formatters({}).keys if formats.empty?
-                content_types = Grape::ContentTypes::CONTENT_TYPES.select{|content_type, mime_type| formats.include? content_type}.values
-              end
-
-              content_types.uniq
-            end
-
-            def parse_info(info)
-              {
-                contact:            info[:contact],
-                description:        as_markdown(info[:description]),
-                license:            info[:license],
-                licenseUrl:         info[:license_url],
-                termsOfServiceUrl:  info[:terms_of_service_url],
-                title:              info[:title]
-              }.delete_if{|_, value| value.blank?}
-            end
-
-            def parse_header_params(params)
-              params ||= []
-
-              params.map do |param, value|
-                dataType    = 'String'
-                description = value.is_a?(Hash) ? value[:description] : ''
-                required    = value.is_a?(Hash) ? !!value[:required] : false
-                defaultValue = value.is_a?(Hash) ? value[:defaultValue] : nil
-                paramType   = "header"
-
-                parsed_params = {
-                  paramType:    paramType,
-                  name:         param,
-                  description:  as_markdown(description),
-                  type:         dataType,
-                  dataType:     dataType,
-                  required:     required
-                }
-
-                parsed_params.merge!({defaultValue: defaultValue}) if defaultValue
-
-                parsed_params
-              end
-            end
-
-            def parse_path(path, version)
-              # adapt format to swagger format
-              parsed_path = path.gsub('(.:format)', @@hide_format ? '' : '.{format}')
-              # This is attempting to emulate the behavior of
-              # Rack::Mount::Strexp. We cannot use Strexp directly because
-              # all it does is generate regular expressions for parsing URLs.
-              # TODO: Implement a Racc tokenizer to properly generate the
-              # parsed path.
-              parsed_path = parsed_path.gsub(/:([a-zA-Z_]\w*)/, '{\1}')
-              # add the version
-              version ? parsed_path.gsub('{version}', version) : parsed_path
-            end
-
-            def parse_entity_name(name)
-              entity_parts = name.to_s.split('::')
-              idx = entity_parts.rindex {|p| p == "Entity" || p == "Entities" }
-              if idx.nil?
-                idx = 0
-              else
-                idx = idx + 1
-              end
-              entity_parts[idx..-1].join('::')
-            end
-
-            def parse_entity_models(models)
-              result = {}
-
-              models.each do |model|
-                name        = parse_entity_name(model)
-                properties  = {}
-
-                model.documentation.each do |property_name, property_info|
-                  properties[property_name] = property_info
-
-                  # rename Grape Entity's "desc" to "description"
-                  if property_description = property_info.delete(:desc)
-                    property_info[:description] = property_description
-                  end
-                end
-
-                result[name] = {
-                  id:         model.instance_variable_get(:@root) || name,
-                  name:       model.instance_variable_get(:@root) || name,
-                  properties: properties
-                }
-
-                nested_models = []
-
-                model.exposures.each do |k,options|
-                  nested_models << options[:using] if options[:using]
-                end
-
-                parse_entity_models(nested_models).each {|k,v| result[k] = v }
-              end
-
-              result
-            end
-
-            def parse_http_codes codes
-              codes ||= {}
-              codes.map do |k, v|
-                {
-                  code: k,
-                  message: v,
-                  #responseModel: ...
-                }
-              end
-            end
-
-            def try(*args, &block)
-              if args.empty? && block_given?
-                yield self
-              elsif respond_to?(args.first)
-                public_send(*args, &block)
-              end
-            end
-
-            def strip_heredoc(string)
-              indent = string.scan(/^[ \t]*(?=\S)/).min.try(:size) || 0
-              string.gsub(/^[ \t]{#{indent}}/, '')
-            end
-
-            def parse_base_path(base_path, request)
-              if base_path.is_a?(Proc)
-                base_path.call(request)
-              elsif base_path.is_a?(String)
-                URI(base_path).relative? ? URI.join(request.base_url, base_path).to_s : base_path
-              else
-                request.base_url
-              end
-            end
-          end
+          extend GrapeSwagger::DocMethods
         end
       end
     end
